@@ -85,6 +85,7 @@ class TestUtils {
     */
 
     static unzipAndTest(String path, String entryName, conf, Map<String, String> replacementsMap=[:]) {
+        AstBuilder.enableProfiling = true
         AbstractParser antlr4Parser = new Antlr4Parser()
         AbstractParser antlr2Parser = new Antlr2Parser()
 

@@ -20,13 +20,17 @@ package org.apache.groovy.parser.antlr4;
 
 import groovy.lang.Tuple2;
 import org.antlr.v4.runtime.ANTLRErrorListener;
+import org.antlr.v4.runtime.BailErrorStrategy;
 import org.antlr.v4.runtime.CharStream;
 import org.antlr.v4.runtime.CharStreams;
 import org.antlr.v4.runtime.CommonTokenStream;
+import org.antlr.v4.runtime.DefaultErrorStrategy;
 import org.antlr.v4.runtime.RecognitionException;
 import org.antlr.v4.runtime.Recognizer;
 import org.antlr.v4.runtime.Token;
+import org.antlr.v4.runtime.atn.DecisionInfo;
 import org.antlr.v4.runtime.atn.PredictionMode;
+import org.antlr.v4.runtime.atn.ProfilingATNSimulator;
 import org.antlr.v4.runtime.misc.ParseCancellationException;
 import org.antlr.v4.runtime.tree.ParseTree;
 import org.antlr.v4.runtime.tree.TerminalNode;
@@ -354,6 +358,9 @@ import static org.codehaus.groovy.runtime.DefaultGroovyMethods.last;
  *         Created on 2016/08/14
  */
 public class AstBuilder extends GroovyParserBaseVisitor<Object> implements GroovyParserVisitor<Object> {
+    public static boolean enableProfiling;
+    private static final List<DecisionInfo[]> DECISION_INFOS = Collections.synchronizedList(new ArrayList<>());
+
     public AstBuilder(SourceUnit sourceUnit) {
         this.sourceUnit = sourceUnit;
         this.moduleNode = new ModuleNode(sourceUnit);
@@ -365,10 +372,58 @@ public class AstBuilder extends GroovyParserBaseVisitor<Object> implements Groov
                 new GroovyLangParser(
                     new CommonTokenStream(this.lexer));
 
+        if (enableProfiling) {
+            this.parser.setInterpreter(new ProfilingATNSimulator(this.parser));
+        }
+
         this.parser.setErrorHandler(new DescriptiveErrorStrategy(charStream));
 
         this.tryWithResourcesASTTransformation = new TryWithResourcesASTTransformation(this);
         this.groovydocManager = GroovydocManager.getInstance();
+    }
+
+    public DecisionInfo[] getDecisionInfo() {
+        DecisionInfo[] result = new DecisionInfo[0];
+        for (DecisionInfo[] decisionInfo : DECISION_INFOS) {
+            if (result.length < decisionInfo.length) {
+                result = Arrays.copyOf(result, decisionInfo.length);
+            }
+
+            for (int i = 0; i < decisionInfo.length; i++) {
+                if (result[i] == null) {
+                    result[i] = decisionInfo[i];
+                } else {
+                    assert result[i].decision == decisionInfo[i].decision;
+                    result[i].invocations += decisionInfo[i].invocations;
+                    result[i].timeInPrediction += decisionInfo[i].timeInPrediction;
+                    result[i].SLL_TotalLook += decisionInfo[i].SLL_TotalLook;
+                    result[i].SLL_MinLook = Math.min(result[i].SLL_MinLook, decisionInfo[i].SLL_MinLook);
+                    if (decisionInfo[i].SLL_MaxLook > result[i].SLL_MaxLook) {
+                        result[i].SLL_MaxLook = decisionInfo[i].SLL_MaxLook;
+                        result[i].SLL_MaxLookEvent = decisionInfo[i].SLL_MaxLookEvent;
+                    }
+
+                    result[i].LL_TotalLook += decisionInfo[i].LL_TotalLook;
+                    result[i].LL_MinLook = Math.min(result[i].LL_MinLook, decisionInfo[i].LL_MinLook);
+                    if (decisionInfo[i].LL_MaxLook > result[i].LL_MaxLook) {
+                        result[i].LL_MaxLook = decisionInfo[i].LL_MaxLook;
+                        result[i].LL_MaxLookEvent = decisionInfo[i].LL_MaxLookEvent;
+                    }
+
+                    result[i].contextSensitivities.addAll(decisionInfo[i].contextSensitivities);
+                    result[i].errors.addAll(decisionInfo[i].errors);
+                    result[i].ambiguities.addAll(decisionInfo[i].ambiguities);
+                    result[i].predicateEvals.addAll(decisionInfo[i].predicateEvals);
+                    result[i].SLL_ATNTransitions += decisionInfo[i].invocations;
+                    result[i].SLL_DFATransitions += decisionInfo[i].invocations;
+                    result[i].LL_Fallback += decisionInfo[i].invocations;
+                    result[i].LL_ATNTransitions += decisionInfo[i].invocations;
+                    result[i].LL_DFATransitions += decisionInfo[i].invocations;
+                }
+            }
+        }
+
+        return result;
     }
 
     private CharStream createCharStream(SourceUnit sourceUnit) {
@@ -386,20 +441,26 @@ public class AstBuilder extends GroovyParserBaseVisitor<Object> implements Groov
     }
 
     private GroovyParserRuleContext buildCST() throws CompilationFailedException {
-        GroovyParserRuleContext result;
+        GroovyParserRuleContext result = null;
 
         try {
             // parsing have to wait util clearing is complete.
             AtnManager.RRWL.readLock().lock();
             try {
-                result = buildCST(PredictionMode.SLL);
-            } catch (Throwable t) {
-                // if some syntax error occurred in the lexer, no need to retry the powerful LL mode
-                if (t instanceof GroovySyntaxError && GroovySyntaxError.LEXER == ((GroovySyntaxError) t).getSource()) {
-                    throw t;
+                try {
+                    if (!enableProfiling) {
+                        result = buildCST(PredictionMode.SLL);
+                    }
+                } catch (Throwable t) {
+                    // if some syntax error occurred in the lexer, no need to retry the powerful LL mode
+                    if (t instanceof GroovySyntaxError && GroovySyntaxError.LEXER == ((GroovySyntaxError) t).getSource()) {
+                        throw t;
+                    }
                 }
 
-                result = buildCST(PredictionMode.LL);
+                if (result == null) {
+                    result = buildCST(enableProfiling ? PredictionMode.LL_EXACT_AMBIG_DETECTION : PredictionMode.LL);
+                }
             } finally {
                 AtnManager.RRWL.readLock().unlock();
             }
@@ -411,6 +472,10 @@ public class AstBuilder extends GroovyParserBaseVisitor<Object> implements Groov
     }
 
     private GroovyParserRuleContext buildCST(PredictionMode predictionMode) {
+        if (enableProfiling) {
+            parser.setInterpreter(new ProfilingATNSimulator(parser));
+        }
+
         parser.getInterpreter().setPredictionMode(predictionMode);
 
         if (PredictionMode.SLL.equals(predictionMode)) {
@@ -420,7 +485,13 @@ public class AstBuilder extends GroovyParserBaseVisitor<Object> implements Groov
             this.addErrorListeners();
         }
 
-        return parser.compilationUnit();
+        try {
+            return parser.compilationUnit();
+        } finally {
+            if (enableProfiling) {
+                DECISION_INFOS.add(((ProfilingATNSimulator) parser.getInterpreter()).getDecisionInfo());
+            }
+        }
     }
 
     private CompilationFailedException convertException(Throwable t) {
